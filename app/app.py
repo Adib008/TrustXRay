@@ -1,0 +1,191 @@
+"""TrustXRay — uncertainty-aware pneumonia detection on chest X-rays (research demo)."""
+import glob
+import json
+import os
+import urllib.request
+
+import matplotlib.cm as cm
+import numpy as np
+import streamlit as st
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from torchvision import models, transforms
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_URL = "https://github.com/Adib008/TrustXRay/releases/download/v1.0/resnet18_baseline.pt"
+MODEL_PATH = os.environ.get("TRUSTXRAY_MODEL", os.path.join(APP_DIR, "resnet18_baseline.pt"))
+with open(os.path.join(APP_DIR, "trustxray_config.json")) as f:
+    CONFIG = json.load(f)
+
+THR_LOGIT = CONFIG["threshold_logit"]
+Z_CUTOFF = CONFIG["z_cutoff"]
+T = CONFIG["mc_passes"]
+SIZE = 224
+IMAGENET_MEAN, IMAGENET_STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+st.set_page_config(page_title="TrustXRay", page_icon="🫁", layout="wide")
+
+
+# ---------------------------------------------------------------- model
+def build_model(dropout):
+    model = models.resnet18(weights=None)
+    model.fc = nn.Sequential(nn.Dropout(p=dropout), nn.Linear(model.fc.in_features, 1))
+    return model
+
+
+@st.cache_resource(show_spinner="Loading the model (first launch only)...")
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    model = build_model(CONFIG["dropout"])
+    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+    model.eval()
+    return model
+
+
+preprocess = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+
+def prepare_image(img):
+    """Grayscale -> center square crop -> 224x224 (same as MedMNIST)."""
+    img = img.convert("L")
+    w, h = img.size
+    s = min(w, h)
+    img = img.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
+    return img.resize((SIZE, SIZE), Image.BILINEAR)
+
+
+# ---------------------------------------------------------------- inference
+@torch.no_grad()
+def mc_dropout(model, x):
+    """T stochastic passes with dropout active (dropout is only in the head)."""
+    torch.manual_seed(0)  # reproducible result for the same image
+    feature_extractor = nn.Sequential(*list(model.children())[:-1])
+    feats = feature_extractor(x).flatten(1)
+    model.fc.train()
+    logits = torch.stack([model.fc(feats).squeeze() for _ in range(T)]).numpy()
+    model.fc.eval()
+    return logits
+
+
+def grad_cam(model, x):
+    store = {}
+
+    def fwd_hook(module, inp, out):
+        store["act"] = out
+        out.register_hook(lambda g: store.__setitem__("grad", g))
+
+    handle = model.layer4.register_forward_hook(fwd_hook)
+    model.zero_grad()
+    score = model(x.requires_grad_(True)).squeeze()
+    score.backward()
+    handle.remove()
+    weights = store["grad"].mean(dim=(2, 3), keepdim=True)
+    cam = F.relu((weights * store["act"]).sum(dim=1, keepdim=True))
+    cam = F.interpolate(cam, size=(SIZE, SIZE), mode="bilinear", align_corners=False)
+    cam = cam.squeeze().detach().numpy()
+    return cam / (cam.max() + 1e-8)
+
+
+def overlay(gray_img, cam, alpha=0.45):
+    base = np.asarray(gray_img.convert("RGB"), dtype=np.float32) / 255.0
+    heat = cm.jet(cam)[..., :3]
+    return np.clip((1 - alpha) * base + alpha * heat, 0, 1)
+
+
+# ---------------------------------------------------------------- UI
+st.title("🫁 TrustXRay")
+st.markdown("**Uncertainty-aware pneumonia detection on pediatric chest X-rays** — "
+            "the AI tells you what it predicts, *how sure it is*, *where it looked*, "
+            "and refers uncertain cases to a radiologist.")
+st.warning("⚠️ **Research demo — not a medical device.** Not clinically validated. Do not use for diagnosis.")
+
+with st.sidebar:
+    st.header("How it works")
+    st.markdown(
+        f"1. **ResNet18** (transfer learning) trained on PneumoniaMNIST (pediatric X-rays).\n"
+        f"2. **Monte Carlo Dropout**: the X-ray is analysed **{T} times** with random dropout.\n"
+        f"3. **Uncertainty z** = distance to the decision boundary, in standard deviations.\n"
+        f"4. If z < {Z_CUTOFF:.1f} → **referred to a radiologist**.\n"
+        f"5. **Grad-CAM** shows the regions that pushed toward *pneumonia*."
+    )
+    st.header("Test-set results")
+    st.markdown(
+        "- AUC **0.990**\n"
+        "- Sensitivity **99.5%** on all cases\n"
+        "- With referral (16.8% of cases): **100%** sensitivity on the cases kept by the AI, "
+        "**2/2** missed pneumonias caught"
+    )
+    st.header("Limitations")
+    st.markdown("Children aged 1–5 only, one hospital, low-resolution images. "
+                "Works best on frontal pediatric chest X-rays similar to the training data.")
+    st.markdown("[GitHub repository](https://github.com/Adib008/TrustXRay)")
+
+model = load_model()
+
+examples = sorted(glob.glob(os.path.join(APP_DIR, "examples", "*.png")))
+source = st.radio("Choose an X-ray", ["Example from the test set", "Upload my own image"], horizontal=True)
+img = None
+if source == "Example from the test set" and examples:
+    names = [os.path.splitext(os.path.basename(p))[0] for p in examples]
+    choice = st.selectbox("Example", names)
+    img = Image.open(examples[names.index(choice)])
+elif source == "Upload my own image":
+    up = st.file_uploader("Frontal chest X-ray (PNG or JPG)", type=["png", "jpg", "jpeg"])
+    if up is not None:
+        img = Image.open(up)
+elif not examples:
+    st.info("No example images found — upload an image instead.")
+
+if img is not None:
+    gray = prepare_image(img)
+    x = preprocess(gray.convert("RGB")).unsqueeze(0)
+
+    logits = mc_dropout(model, x)
+    mean, std = float(logits.mean()), float(logits.std() + 1e-6)
+    votes = int((logits >= THR_LOGIT).sum())
+    pred_pneumonia = mean >= THR_LOGIT
+    z = abs(mean - THR_LOGIT) / std
+    referred = z < Z_CUTOFF
+    cam = grad_cam(model, preprocess(gray.convert("RGB")).unsqueeze(0))
+
+    col1, col2, col3 = st.columns([1, 1, 1.1])
+    with col1:
+        st.subheader("X-ray")
+        st.image(gray, width="stretch")
+    with col2:
+        st.subheader("Grad-CAM")
+        st.image(overlay(gray, cam), width="stretch",
+                 caption="Red = regions pushing toward 'pneumonia'")
+    with col3:
+        st.subheader("Decision")
+        label = "PNEUMONIA" if pred_pneumonia else "NORMAL"
+        if referred:
+            st.warning(f"### ⚠️ Uncertain — refer to a radiologist\nThe model leans toward **{label}** but is not sure.")
+        elif pred_pneumonia:
+            st.error("### 🔴 Pneumonia detected\nConfident prediction.")
+        else:
+            st.success("### 🟢 Normal\nConfident prediction.")
+
+        st.metric("Votes for pneumonia", f"{votes} / {T}")
+        st.progress(votes / T)
+        st.metric("Uncertainty score z", f"{z:.1f}")
+        st.caption(f"Referral cut-off: z < {Z_CUTOFF:.1f} → "
+                   + ("**below the cut-off → referred**" if referred else "above the cut-off → AI decides"))
+
+    with st.expander("How to read these results"):
+        st.markdown(
+            f"- **Votes**: out of {T} analyses with random dropout, how many say *pneumonia*. "
+            f"{T}/{T} or 0/{T} = all analyses agree.\n"
+            f"- **z**: how far the average answer is from the decision boundary, measured in standard "
+            f"deviations of the {T} answers. Small z = the answers are close to the boundary = uncertain.\n"
+            f"- The referral cut-off (z < {Z_CUTOFF:.1f}) was chosen on the validation set (≈10% of cases referred).\n"
+            "- We do not display a probability: the model's probabilities are not calibrated "
+            "(class weighting shifts them), so a number like '92%' would be misleading.\n"
+            "- On normal X-rays the Grad-CAM map is often nearly empty: there is no evidence for pneumonia to show."
+        )

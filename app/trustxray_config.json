@@ -1,0 +1,9 @@
+{
+  "model_file": "resnet18_baseline.pt",
+  "mc_passes": 30,
+  "dropout": 0.3,
+  "threshold_logit": -3.0871853828430176,
+  "threshold_prob": 0.0436389510890049,
+  "z_cutoff": 11.965063095092773,
+  "refer_rate_validation": 0.1
+}
