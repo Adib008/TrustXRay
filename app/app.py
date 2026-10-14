@@ -2,6 +2,7 @@
 import glob
 import json
 import os
+import threading
 import urllib.request
 
 import matplotlib.cm as cm
@@ -26,6 +27,9 @@ SIZE = 224
 IMAGENET_MEAN, IMAGENET_STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 
 st.set_page_config(page_title="TrustXRay", page_icon="🫁", layout="wide")
+
+# The model is shared by all visitors of the app: one prediction at a time.
+MODEL_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------- model
@@ -78,18 +82,28 @@ def grad_cam(model, x):
 
     def fwd_hook(module, inp, out):
         store["act"] = out
-        out.register_hook(lambda g: store.__setitem__("grad", g))
+        if out.requires_grad:  # never fails, even if called without gradients
+            out.register_hook(lambda g: store.__setitem__("grad", g))
 
     handle = model.layer4.register_forward_hook(fwd_hook)
-    model.zero_grad()
-    score = model(x.requires_grad_(True)).squeeze()
-    score.backward()
-    handle.remove()
+    try:
+        model.zero_grad()
+        score = model(x.requires_grad_(True)).squeeze()
+        score.backward()
+    finally:
+        handle.remove()  # always remove the hook, even after an error
     weights = store["grad"].mean(dim=(2, 3), keepdim=True)
     cam = F.relu((weights * store["act"]).sum(dim=1, keepdim=True))
     cam = F.interpolate(cam, size=(SIZE, SIZE), mode="bilinear", align_corners=False)
     cam = cam.squeeze().detach().numpy()
     return cam / (cam.max() + 1e-8)
+
+
+def looks_like_xray(img):
+    """X-rays are grayscale: reject clearly colored images (photos, screenshots...)."""
+    rgb = np.asarray(img.convert("RGB").resize((128, 128)), dtype=np.float32) / 255.0
+    saturation = (rgb.max(axis=2) - rgb.min(axis=2)).mean()
+    return saturation < 0.08
 
 
 def overlay(gray_img, cam, alpha=0.45):
@@ -136,23 +150,36 @@ if source == "Example from the test set" and examples:
     choice = st.selectbox("Example", names)
     img = Image.open(examples[names.index(choice)])
 elif source == "Upload my own image":
+    st.info("ℹ️ This model was trained **only on frontal chest X-rays of children aged 1–5** "
+            "(one hospital, low resolution). Results on other images are not meaningful.")
     up = st.file_uploader("Frontal chest X-ray (PNG or JPG)", type=["png", "jpg", "jpeg"])
     if up is not None:
         img = Image.open(up)
 elif not examples:
     st.info("No example images found — upload an image instead.")
 
+if img is not None and source == "Upload my own image" and not looks_like_xray(img):
+    st.error("🚫 **This does not look like a chest X-ray** (the image contains colors). "
+             "Please upload a grayscale frontal chest X-ray.")
+    img = None
+
 if img is not None:
     gray = prepare_image(img)
     x = preprocess(gray.convert("RGB")).unsqueeze(0)
 
-    logits = mc_dropout(model, x)
+    with MODEL_LOCK:
+        model.layer4._forward_hooks.clear()  # safety: remove any leftover hook
+        logits = mc_dropout(model, x)
+        cam = grad_cam(model, preprocess(gray.convert("RGB")).unsqueeze(0))
     mean, std = float(logits.mean()), float(logits.std() + 1e-6)
     votes = int((logits >= THR_LOGIT).sum())
     pred_pneumonia = mean >= THR_LOGIT
     z = abs(mean - THR_LOGIT) / std
     referred = z < Z_CUTOFF
-    cam = grad_cam(model, preprocess(gray.convert("RGB")).unsqueeze(0))
+
+    if source == "Upload my own image":
+        st.warning("⚠️ **Out-of-distribution warning:** this image does not come from the training dataset. "
+                   "The model has not been validated on external images — interpret with caution.")
 
     col1, col2, col3 = st.columns([1, 1, 1.1])
     with col1:
