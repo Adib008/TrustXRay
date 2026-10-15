@@ -49,6 +49,21 @@ def load_model():
     return model
 
 
+@st.cache_resource(show_spinner=False)
+def load_ood_stats():
+    path = os.path.join(APP_DIR, "ood_stats.npz")
+    if not os.path.exists(path):
+        return None
+    d = np.load(path)
+    return d["mu"].astype(np.float64), d["precision"].astype(np.float64), float(d["threshold"])
+
+
+def mahalanobis(feats, stats):
+    mu, precision, _ = stats
+    diff = feats.astype(np.float64) - mu
+    return float(np.sqrt(diff @ precision @ diff))
+
+
 preprocess = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
@@ -74,7 +89,7 @@ def mc_dropout(model, x):
     model.fc.train()
     logits = torch.stack([model.fc(feats).squeeze() for _ in range(T)]).numpy()
     model.fc.eval()
-    return logits
+    return logits, feats.squeeze(0).numpy()
 
 
 def grad_cam(model, x):
@@ -97,6 +112,11 @@ def grad_cam(model, x):
     cam = F.interpolate(cam, size=(SIZE, SIZE), mode="bilinear", align_corners=False)
     cam = cam.squeeze().detach().numpy()
     return cam / (cam.max() + 1e-8)
+
+
+def is_almost_uniform(img):
+    """Blank or nearly blank image (all white, all black, uniform gray)."""
+    return float(np.asarray(img.convert("L"), dtype=np.float32).std()) < 8.0
 
 
 def looks_like_xray(img):
@@ -126,7 +146,9 @@ with st.sidebar:
         f"2. **Monte Carlo Dropout**: the X-ray is analysed **{T} times** with random dropout.\n"
         f"3. **Uncertainty z** = distance to the decision boundary, in standard deviations.\n"
         f"4. If z < {Z_CUTOFF:.1f} → **referred to a radiologist**.\n"
-        f"5. **Grad-CAM** shows the regions that pushed toward *pneumonia*."
+        f"5. **Grad-CAM** shows the regions that pushed toward *pneumonia*.\n"
+        f"6. **Out-of-distribution check** (Mahalanobis distance): images too different from "
+        f"the training X-rays are **refused**."
     )
     st.header("Test-set results")
     st.markdown(
@@ -141,6 +163,7 @@ with st.sidebar:
     st.markdown("[GitHub repository](https://github.com/Adib008/TrustXRay)")
 
 model = load_model()
+ood_stats = load_ood_stats()
 
 examples = sorted(glob.glob(os.path.join(APP_DIR, "examples", "*.png")))
 source = st.radio("Choose an X-ray", ["Example from the test set", "Upload my own image"], horizontal=True)
@@ -163,13 +186,29 @@ if img is not None and source == "Upload my own image" and not looks_like_xray(i
              "Please upload a grayscale frontal chest X-ray.")
     img = None
 
+if img is not None and is_almost_uniform(img):
+    st.error("🚫 **This image is almost uniform** (blank, white or black). Please upload a chest X-ray.")
+    img = None
+
 if img is not None:
     gray = prepare_image(img)
     x = preprocess(gray.convert("RGB")).unsqueeze(0)
 
     with MODEL_LOCK:
         model.layer4._forward_hooks.clear()  # safety: remove any leftover hook
-        logits = mc_dropout(model, x)
+        logits, feats = mc_dropout(model, x)
+
+    ood_distance = mahalanobis(feats, ood_stats) if ood_stats else None
+    if ood_distance is not None and ood_distance > ood_stats[2]:
+        st.error(f"🚫 **Out of distribution — the model refuses to answer.**\n\n"
+                 f"This image is too different from the chest X-rays used for training "
+                 f"(distance {ood_distance:.0f} > limit {ood_stats[2]:.0f}). "
+                 f"The model is only valid on frontal pediatric chest X-rays.")
+        st.image(gray, width=300)
+        st.stop()
+
+    with MODEL_LOCK:
+        model.layer4._forward_hooks.clear()
         cam = grad_cam(model, preprocess(gray.convert("RGB")).unsqueeze(0))
     mean, std = float(logits.mean()), float(logits.std() + 1e-6)
     votes = int((logits >= THR_LOGIT).sum())
@@ -204,6 +243,8 @@ if img is not None:
         st.metric("Uncertainty score z", f"{z:.1f}")
         st.caption(f"Referral cut-off: z < {Z_CUTOFF:.1f} → "
                    + ("**below the cut-off → referred**" if referred else "above the cut-off → AI decides"))
+        if ood_distance is not None:
+            st.caption(f"✅ Familiarity check passed: distance {ood_distance:.0f} ≤ limit {ood_stats[2]:.0f}")
 
     with st.expander("How to read these results"):
         st.markdown(
