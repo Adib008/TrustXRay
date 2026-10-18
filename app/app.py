@@ -21,6 +21,7 @@ with open(os.path.join(APP_DIR, "trustxray_config.json")) as f:
     CONFIG = json.load(f)
 
 THR_LOGIT = CONFIG["threshold_logit"]
+OOD_HARD_FACTOR = 1.2  # distance between limit and 1.2 x limit -> referred; above -> refused
 Z_CUTOFF = CONFIG["z_cutoff"]
 T = CONFIG["mc_passes"]
 SIZE = 224
@@ -147,8 +148,8 @@ with st.sidebar:
         f"3. **Uncertainty z** = distance to the decision boundary, in standard deviations.\n"
         f"4. If z < {Z_CUTOFF:.1f} → **referred to a radiologist**.\n"
         f"5. **Grad-CAM** shows the regions that pushed toward *pneumonia*.\n"
-        f"6. **Out-of-distribution check** (Mahalanobis distance): images too different from "
-        f"the training X-rays are **refused**."
+        f"6. **Out-of-distribution check** (Mahalanobis distance to the training X-rays): "
+        f"slightly unusual images are **referred**, very different images are **refused**."
     )
     st.header("Test-set results")
     st.markdown(
@@ -199,13 +200,15 @@ if img is not None:
         logits, feats = mc_dropout(model, x)
 
     ood_distance = mahalanobis(feats, ood_stats) if ood_stats else None
-    if ood_distance is not None and ood_distance > ood_stats[2]:
+    ood_limit = ood_stats[2] if ood_stats else None
+    if ood_distance is not None and ood_distance > OOD_HARD_FACTOR * ood_limit:
         st.error(f"🚫 **Out of distribution — the model refuses to answer.**\n\n"
                  f"This image is too different from the chest X-rays used for training "
-                 f"(distance {ood_distance:.0f} > limit {ood_stats[2]:.0f}). "
-                 f"The model is only valid on frontal pediatric chest X-rays.")
+                 f"(distance {ood_distance:.1f} > refusal limit {OOD_HARD_FACTOR * ood_limit:.1f}). "
+                 f"The model is only valid on frontal pediatric chest X-rays of good quality.")
         st.image(gray, width=300)
         st.stop()
+    unusual = ood_distance is not None and ood_distance > ood_limit
 
     with MODEL_LOCK:
         model.layer4._forward_hooks.clear()
@@ -214,7 +217,7 @@ if img is not None:
     votes = int((logits >= THR_LOGIT).sum())
     pred_pneumonia = mean >= THR_LOGIT
     z = abs(mean - THR_LOGIT) / std
-    referred = z < Z_CUTOFF
+    referred = (z < Z_CUTOFF) or unusual
 
     if source == "Upload my own image":
         st.warning("⚠️ **Out-of-distribution warning:** this image does not come from the training dataset. "
@@ -231,7 +234,10 @@ if img is not None:
     with col3:
         st.subheader("Decision")
         label = "PNEUMONIA" if pred_pneumonia else "NORMAL"
-        if referred:
+        if unusual:
+            st.warning(f"### ⚠️ Unusual image — refer to a radiologist\nThe model leans toward **{label}**, "
+                       "but this image is less typical than 99% of the training X-rays, so the AI does not decide.")
+        elif referred:
             st.warning(f"### ⚠️ Uncertain — refer to a radiologist\nThe model leans toward **{label}** but is not sure.")
         elif pred_pneumonia:
             st.error("### 🔴 Pneumonia detected\nConfident prediction.")
@@ -242,9 +248,13 @@ if img is not None:
         st.progress(votes / T)
         st.metric("Uncertainty score z", f"{z:.1f}")
         st.caption(f"Referral cut-off: z < {Z_CUTOFF:.1f} → "
-                   + ("**below the cut-off → referred**" if referred else "above the cut-off → AI decides"))
+                   + ("**below the cut-off → referred**" if z < Z_CUTOFF else "above the cut-off"))
         if ood_distance is not None:
-            st.caption(f"✅ Familiarity check passed: distance {ood_distance:.0f} ≤ limit {ood_stats[2]:.0f}")
+            if unusual:
+                st.caption(f"⚠️ Familiarity check: distance {ood_distance:.1f} > {ood_limit:.1f} "
+                           f"(unusual) but ≤ {OOD_HARD_FACTOR * ood_limit:.1f} (not refused) → referred")
+            else:
+                st.caption(f"✅ Familiarity check passed: distance {ood_distance:.1f} ≤ {ood_limit:.1f}")
 
     with st.expander("How to read these results"):
         st.markdown(
